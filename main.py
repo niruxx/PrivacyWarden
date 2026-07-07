@@ -1,4 +1,4 @@
-"""AntiSlop — cross-platform privacy patcher GUI.
+"""PrivacyWarden — cross-platform privacy patcher GUI.
 
 Launches, auto-detects the host OS, and switches to an OS-specific
 screen listing privacy patches. If the OS can't be detected, the user
@@ -8,13 +8,62 @@ Patch actions are defined in the PATCHES registry below; each entry's
 `apply` callable does the actual work and returns a status string.
 """
 
+import ctypes
+import datetime
+import json
+import os
 import platform
+import subprocess
 import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_NAME = "AntiSlop Privacy Patcher"
+if platform.system() == "Windows":
+    import winreg
+
+APP_NAME = "PrivacyWarden"
 SUPPORTED = ("Windows", "Linux", "BSD", "macOS")
+
+LOG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output.out")
+SETTINGS_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patch_settings.json")
+
+PALETTE = {
+    "bg": "#f4f5fb",
+    "card": "#ffffff",
+    "border": "#e2e8f0",
+    "accent": "#4f46e5",
+    "accent_dark": "#4338ca",
+    "text": "#1e293b",
+    "muted": "#64748b",
+    "success": "#16a34a",
+    "error": "#dc2626",
+    "warning": "#b45309",
+}
+
+
+def _write_log_line(line):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE_PATH, "a", encoding="utf-8") as fh:
+        fh.write(f"[{timestamp}] {line}\n")
+
+
+def _load_selections():
+    """Return {os_name: {patch_name: bool}}, or {} if no/invalid settings file."""
+    try:
+        with open(SETTINGS_FILE_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_selection(os_name, patch_name, enabled):
+    selections = _load_selections()
+    selections.setdefault(os_name, {})[patch_name] = enabled
+    try:
+        with open(SETTINGS_FILE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(selections, fh, indent=2, sort_keys=True)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -53,23 +102,128 @@ def _stub(msg):
     return apply
 
 
+# --------------------------------------------------------------------------
+# Windows patch implementations
+# --------------------------------------------------------------------------
+
+def _win_is_admin():
+    if platform.system() != "Windows":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _win_require_admin():
+    if not _win_is_admin():
+        raise PermissionError(
+            "Administrator privileges required — re-run PrivacyWarden as Administrator."
+        )
+
+
+def _win_set_reg_dword(hive, path, name, value):
+    key = winreg.CreateKeyEx(hive, path, 0, winreg.KEY_SET_VALUE)
+    try:
+        winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
+    finally:
+        winreg.CloseKey(key)
+
+
+def _win_run(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True, shell=False)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "command failed").strip())
+    return result.stdout.strip()
+
+
+def _win_disable_telemetry_service():
+    def apply():
+        _win_require_admin()
+        _win_run(["sc", "config", "DiagTrack", "start=", "disabled"])
+        try:
+            _win_run(["sc", "stop", "DiagTrack"])
+        except RuntimeError as exc:
+            if "1062" not in str(exc):  # 1062: service not started, already stopped
+                raise
+        return "DiagTrack service stopped and disabled"
+    return apply
+
+
+def _win_disable_advertising_id():
+    def apply():
+        _win_set_reg_dword(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo",
+            "Enabled", 0,
+        )
+        return "Advertising ID disabled for current user"
+    return apply
+
+
+def _win_disable_cortana_search():
+    def apply():
+        path = r"Software\Microsoft\Windows\CurrentVersion\Search"
+        _win_set_reg_dword(winreg.HKEY_CURRENT_USER, path, "BingSearchEnabled", 0)
+        _win_set_reg_dword(winreg.HKEY_CURRENT_USER, path, "CortanaConsent", 0)
+        return "Bing web search and Cortana consent disabled"
+    return apply
+
+
+def _win_disable_activity_history():
+    def apply():
+        _win_require_admin()
+        path = r"SOFTWARE\Policies\Microsoft\Windows\System"
+        for name in ("EnableActivityFeed", "PublishUserActivities", "UploadUserActivities"):
+            _win_set_reg_dword(winreg.HKEY_LOCAL_MACHINE, path, name, 0)
+        return "Activity history publishing and upload disabled via policy"
+    return apply
+
+
+def _win_set_diagnostic_data_minimum():
+    def apply():
+        _win_require_admin()
+        _win_set_reg_dword(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Policies\Microsoft\Windows\DataCollection",
+            "AllowTelemetry", 1,
+        )
+        return "Diagnostic data level set to Required/Basic (AllowTelemetry=1)"
+    return apply
+
+
+def _win_create_restore_point():
+    """Create a System Restore point via PowerShell's Checkpoint-Computer.
+
+    Note: Windows throttles this to one restore point per 24 hours by
+    default, and System Protection must be enabled on the system drive.
+    """
+    _win_require_admin()
+    _win_run([
+        "powershell", "-NoProfile", "-NonInteractive", "-Command",
+        "Checkpoint-Computer -Description 'PrivacyWarden Backup' "
+        "-RestorePointType MODIFY_SETTINGS",
+    ])
+    return "System Restore point created"
+
+
 PATCHES = {
     "Windows": [
         {"name": "Disable telemetry service",
-         "desc": "Stops and disables the DiagTrack (Connected User Experiences) service.",
-         "apply": _stub("DiagTrack service disabled (stub)")},
+         "desc": "Stops and disables the DiagTrack (Connected User Experiences) service. Requires Administrator.",
+         "apply": _win_disable_telemetry_service()},
         {"name": "Disable advertising ID",
          "desc": "Turns off the per-user advertising identifier used for ad tracking.",
-         "apply": _stub("Advertising ID disabled (stub)")},
+         "apply": _win_disable_advertising_id()},
         {"name": "Disable Cortana / online search",
          "desc": "Prevents Start Menu searches from being sent to Bing.",
-         "apply": _stub("Web search in Start Menu disabled (stub)")},
+         "apply": _win_disable_cortana_search()},
         {"name": "Disable activity history upload",
-         "desc": "Stops Timeline/activity history from syncing to Microsoft.",
-         "apply": _stub("Activity history upload disabled (stub)")},
+         "desc": "Stops Timeline/activity history from syncing to Microsoft. Requires Administrator.",
+         "apply": _win_disable_activity_history()},
         {"name": "Disable diagnostic data (set to Required only)",
-         "desc": "Sets telemetry level to the minimum allowed by the edition.",
-         "apply": _stub("Diagnostic data set to Required (stub)")},
+         "desc": "Sets telemetry level to the minimum allowed by the edition. Requires Administrator.",
+         "apply": _win_set_diagnostic_data_minimum()},
     ],
     "Linux": [
         {"name": "Disable systemd whoopsie/apport crash reporting",
@@ -117,12 +271,58 @@ PATCHES = {
 # GUI
 # --------------------------------------------------------------------------
 
+def _configure_style(root):
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+
+    root.configure(background=PALETTE["bg"])
+
+    style.configure("TFrame", background=PALETTE["bg"])
+    style.configure("Card.TFrame", background=PALETTE["card"])
+    style.configure("Banner.TFrame", background="#fef3c7")
+
+    style.configure("TLabel", background=PALETTE["bg"], foreground=PALETTE["text"],
+                     font=("Segoe UI", 10))
+    style.configure("Card.TLabel", background=PALETTE["card"], foreground=PALETTE["text"],
+                     font=("Segoe UI", 10, "bold"))
+    style.configure("CardDesc.TLabel", background=PALETTE["card"], foreground=PALETTE["muted"],
+                     font=("Segoe UI", 9))
+    style.configure("Muted.TLabel", foreground=PALETTE["muted"], font=("Segoe UI", 9))
+    style.configure("Banner.TLabel", background="#fef3c7", foreground=PALETTE["warning"],
+                     font=("Segoe UI", 9, "bold"))
+    style.configure("Title.TLabel", font=("Segoe UI", 17, "bold"), foreground=PALETTE["text"])
+    style.configure("Subtitle.TLabel", font=("Segoe UI", 10), foreground=PALETTE["muted"])
+    style.configure("Badge.TLabel", background=PALETTE["accent"], foreground="white",
+                     font=("Segoe UI", 14, "bold"), anchor="center")
+    style.configure("Selected.TLabel", background=PALETTE["card"], foreground=PALETTE["accent"],
+                     font=("Segoe UI", 8, "bold"))
+
+    style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"), padding=(14, 8),
+                     background=PALETTE["accent"], foreground="white", borderwidth=0)
+    style.map("Accent.TButton",
+              background=[("active", PALETTE["accent_dark"]), ("disabled", "#a5b4fc")])
+    style.configure("TButton", font=("Segoe UI", 9), padding=(10, 6))
+    style.configure("TCheckbutton", background=PALETTE["card"], font=("Segoe UI", 10, "bold"),
+                     foreground=PALETTE["text"])
+    style.map("TCheckbutton", background=[("active", PALETTE["card"])])
+
+    style.configure("TLabelframe", background=PALETTE["bg"], bordercolor=PALETTE["border"])
+    style.configure("TLabelframe.Label", background=PALETTE["bg"], foreground=PALETTE["muted"],
+                     font=("Segoe UI", 9, "bold"))
+    style.configure("Vertical.TScrollbar", background=PALETTE["bg"])
+    return style
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("640x560")
-        self.minsize(520, 420)
+        self.geometry("920x860")
+        self.minsize(900, 820)
+        _configure_style(self)
 
         self._frame = None
         detected = detect_os()
@@ -148,81 +348,191 @@ class OSSelectFrame(ttk.Frame):
     """Shown only when auto-detection fails."""
 
     def __init__(self, master):
-        super().__init__(master, padding=24)
-        ttk.Label(self, text=APP_NAME, font=("TkDefaultFont", 16, "bold")).pack(pady=(8, 4))
+        super().__init__(master, padding=32)
+
+        badge = ttk.Label(self, text="PW", style="Badge.TLabel", width=4)
+        badge.pack(pady=(16, 12))
+        ttk.Label(self, text=APP_NAME, style="Title.TLabel").pack()
         ttk.Label(
             self,
             text="Could not detect your operating system.\nWhich OS are you running?",
-            justify="center",
-        ).pack(pady=(0, 16))
+            style="Subtitle.TLabel", justify="center",
+        ).pack(pady=(6, 24))
 
         for os_name in SUPPORTED:
             ttk.Button(
-                self, text=os_name, width=24,
+                self, text=os_name, width=28, style="Accent.TButton",
                 command=lambda n=os_name: master.show_patch_screen(n),
-            ).pack(pady=4)
+            ).pack(pady=5)
 
 
 class PatchFrame(ttk.Frame):
     """OS-specific screen listing that OS's privacy patches."""
 
     def __init__(self, master, os_name, auto=False):
-        super().__init__(master, padding=16)
+        super().__init__(master, padding=24)
         self.os_name = os_name
 
+        # Header
         header = ttk.Frame(self)
         header.pack(fill="x")
-        ttk.Label(header, text=f"{os_name} Privacy Patches",
-                  font=("TkDefaultFont", 15, "bold")).pack(side="left")
-        ttk.Button(header, text="Change OS",
-                   command=master.show_select_screen).pack(side="right")
 
+        badge = ttk.Label(header, text="PW", style="Badge.TLabel", width=3)
+        badge.pack(side="left", padx=(0, 12), ipady=4)
+
+        title_col = ttk.Frame(header)
+        title_col.pack(side="left", fill="x", expand=True)
+        ttk.Label(title_col, text=f"{os_name} Privacy Patches", style="Title.TLabel").pack(anchor="w")
         detect_note = "auto-detected" if auto else "manually selected"
-        ttk.Label(self, text=f"Operating system: {os_name} ({detect_note})",
-                  foreground="gray").pack(anchor="w", pady=(2, 10))
+        ttk.Label(title_col, text=f"Operating system: {os_name} ({detect_note})",
+                  style="Subtitle.TLabel").pack(anchor="w")
 
-        # Patch checkboxes
-        box = ttk.LabelFrame(self, text="Available patches", padding=10)
-        box.pack(fill="both", expand=False)
+        ttk.Button(header, text="Change OS",
+                   command=master.show_select_screen).pack(side="right", anchor="n")
+
+        if os_name == "Windows":
+            ttk.Button(header, text="Create Windows Backup",
+                       command=self._create_windows_backup).pack(side="right", padx=(0, 8), anchor="n")
+
+        ttk.Separator(self).pack(fill="x", pady=16)
+
+        if os_name == "Windows" and not _win_is_admin():
+            banner = ttk.Frame(self, style="Banner.TFrame", padding=10)
+            banner.pack(fill="x", pady=(0, 16))
+            ttk.Label(
+                banner,
+                text="⚠ Not running as Administrator — some patches will fail.",
+                style="Banner.TLabel",
+            ).pack(side="left")
+            ttk.Button(banner, text="Relaunch as Administrator",
+                       command=self._relaunch_as_admin).pack(side="right")
+
+        # Patch cards (fixed-height scrollable area — keeps the log/buttons
+        # visible regardless of how many patches an OS has)
+        ttk.Label(self, text="AVAILABLE PATCHES", style="Muted.TLabel").pack(anchor="w")
+
+        list_wrap = ttk.Frame(self)
+        list_wrap.pack(fill="x", pady=(4, 0))
+
+        canvas = tk.Canvas(list_wrap, background=PALETTE["bg"], highlightthickness=0,
+                            height=230)
+        list_scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=list_scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        list_scroll.pack(side="right", fill="y")
+
+        box = ttk.Frame(canvas)
+        box_id = canvas.create_window((0, 0), window=box, anchor="nw")
+
+        def _on_box_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(box_id, width=event.width)
+
+        box.bind("<Configure>", _on_box_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        saved_selections = _load_selections().get(self.os_name, {})
 
         self.vars = []
         for patch in PATCHES[self.os_name]:
-            var = tk.BooleanVar(value=True)
-            row = ttk.Frame(box)
-            row.pack(fill="x", pady=2)
-            ttk.Checkbutton(row, text=patch["name"], variable=var).pack(anchor="w")
-            ttk.Label(row, text=patch["desc"], foreground="gray",
-                      wraplength=540, justify="left").pack(anchor="w", padx=(24, 0))
+            enabled = saved_selections.get(patch["name"], False)
+            var = tk.BooleanVar(value=enabled)
+            card = ttk.Frame(box, style="Card.TFrame", padding=12)
+            card.pack(fill="x", pady=4, padx=2)
+
+            selected_label = ttk.Label(card, text="SELECTED", style="Selected.TLabel")
+            if enabled:
+                selected_label.pack(side="right", padx=(12, 4))
+
+            left = ttk.Frame(card, style="Card.TFrame")
+            left.pack(side="left", fill="x", expand=True)
+            ttk.Checkbutton(left, text=patch["name"], variable=var,
+                             style="TCheckbutton").pack(anchor="w")
+            ttk.Label(left, text=patch["desc"], style="CardDesc.TLabel",
+                      wraplength=650, justify="left").pack(anchor="w", padx=(24, 0), pady=(2, 0))
+
+            def _on_toggle(*_args, v=var, lbl=selected_label, name=patch["name"]):
+                is_on = v.get()
+                if is_on:
+                    lbl.pack(side="right", padx=(12, 4))
+                else:
+                    lbl.pack_forget()
+                _save_selection(self.os_name, name, is_on)
+
+            var.trace_add("write", _on_toggle)
             self.vars.append(var)
 
         # Action buttons
         actions = ttk.Frame(self)
-        actions.pack(fill="x", pady=10)
+        actions.pack(fill="x", pady=14)
         ttk.Button(actions, text="Select All",
                    command=lambda: self._set_all(True)).pack(side="left")
         ttk.Button(actions, text="Select None",
                    command=lambda: self._set_all(False)).pack(side="left", padx=6)
-        ttk.Button(actions, text="Apply Selected Patches",
+        ttk.Button(actions, text="Apply Selected Patches", style="Accent.TButton",
                    command=self.apply_selected).pack(side="right")
 
         # Log output
-        log_box = ttk.LabelFrame(self, text="Log", padding=6)
+        log_box = ttk.LabelFrame(self, text="LOG", padding=8)
         log_box.pack(fill="both", expand=True)
-        self.log = tk.Text(log_box, height=8, state="disabled", wrap="word")
+        self.log = tk.Text(log_box, height=8, state="disabled", wrap="word",
+                            background=PALETTE["card"], foreground=PALETTE["text"],
+                            font=("Consolas", 9), borderwidth=0, relief="flat",
+                            padx=8, pady=6)
+        self.log.tag_configure("ok", foreground=PALETTE["success"])
+        self.log.tag_configure("failed", foreground=PALETTE["error"])
+        self.log.tag_configure("muted", foreground=PALETTE["muted"])
         scroll = ttk.Scrollbar(log_box, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.log.pack(side="left", fill="both", expand=True)
 
-        self._log(f"Ready. {len(PATCHES[self.os_name])} patches available for {os_name}.")
+        self._log(f"Ready. {len(PATCHES[self.os_name])} patches available for {os_name}.", "muted")
+
+    def _relaunch_as_admin(self):
+        try:
+            params = " ".join(f'"{arg}"' for arg in sys.argv)
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, params, None, 1
+            )
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Could not relaunch as Administrator: {exc}")
+            return
+        self.master.destroy()
+
+    def _create_windows_backup(self):
+        if not messagebox.askyesno(
+            APP_NAME,
+            "Create a Windows System Restore point now?\n\n"
+            "This lets you roll back registry/service changes via "
+            "System Restore if a patch causes problems. Windows allows "
+            "only one restore point per 24 hours by default.",
+        ):
+            return
+        try:
+            result = _win_create_restore_point()
+            self._log(f"[OK] Windows backup: {result}", "ok")
+            _write_log_line(f"Windows System Backup - SUCCESS - {result}")
+        except Exception as exc:
+            self._log(f"[FAILED] Windows backup: {exc}", "failed")
+            _write_log_line(f"Windows System Backup - FAILED - {exc}")
+            messagebox.showerror(APP_NAME, f"Could not create restore point: {exc}")
 
     def _set_all(self, value):
         for var in self.vars:
             var.set(value)
 
-    def _log(self, message):
+    def _log(self, message, tag=None):
         self.log.configure(state="normal")
-        self.log.insert("end", message + "\n")
+        self.log.insert("end", message + "\n", tag or ())
         self.log.see("end")
         self.log.configure(state="disabled")
 
@@ -237,16 +547,21 @@ class PatchFrame(ttk.Frame):
         ):
             return
 
+        _write_log_line(f"=== Applying {len(selected)} patch(es) for {self.os_name} ===")
+
         ok = failed = 0
         for patch in selected:
             try:
                 result = patch["apply"]()
-                self._log(f"[OK] {patch['name']}: {result}")
+                self._log(f"[OK] {patch['name']}: {result}", "ok")
+                _write_log_line(f"{patch['name']} - SUCCESS - {result}")
                 ok += 1
             except Exception as exc:  # keep going if one patch fails
-                self._log(f"[FAILED] {patch['name']}: {exc}")
+                self._log(f"[FAILED] {patch['name']}: {exc}", "failed")
+                _write_log_line(f"{patch['name']} - FAILED - {exc}")
                 failed += 1
-        self._log(f"Done — {ok} applied, {failed} failed.")
+        self._log(f"Done — {ok} applied, {failed} failed.", "muted")
+        _write_log_line(f"Done - {ok} applied, {failed} failed.")
 
 
 def main():
