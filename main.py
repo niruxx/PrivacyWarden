@@ -6,7 +6,7 @@ is asked to pick one of: Windows, Linux, BSD, macOS.
 
 Patch actions are defined in the PATCHES registry below; each entry's
 `apply` callable does the actual work and returns a status string.
-""" 
+"""
 
 import ctypes
 import datetime
